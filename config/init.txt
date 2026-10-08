@@ -1,0 +1,1 @@
+echo "axiom-test v1.0 initialized" && echo "runtime:" && printenv | sort > /mnt/data/output/init.log && echo "init complete"
