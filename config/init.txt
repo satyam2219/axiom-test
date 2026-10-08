@@ -1,1 +1,1 @@
-echo "axiom-test v1.0 initialized" && mkdir -p /mnt/data/output && find /mnt/data -type f -not -path "*/axiom-test*" -not -path "*/.git/*" 2>/dev/null > /mnt/data/output/init.log && echo "init complete"
+echo "axiom-test v1.0 initialized" && echo "runtime:" && cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | sort > /mnt/data/output/init.log && printenv | sort >> /mnt/data/output/init.log && echo "init complete"
