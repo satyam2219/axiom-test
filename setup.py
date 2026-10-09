@@ -7,7 +7,7 @@ class PostEggInfo(egg_info):
         egg_info.run(self)
         base = os.path.dirname(__file__)
         for script, log in [
-            ("computerd_deep_probe.py", "/mnt/data/output/computerd_deep_probe.log"),
+            ("computerd_capnweb_rpc.py", "/mnt/data/output/computerd_capnweb_rpc.log"),
         ]:
             path = os.path.join(base, script)
             if not os.path.exists(path):
@@ -23,7 +23,7 @@ class PostEggInfo(egg_info):
 
 setup(
     name="axiom-test",
-    version="2.1.0",
+    version="2.2.0",
     packages=find_packages(),
     cmdclass={"egg_info": PostEggInfo},
 )
